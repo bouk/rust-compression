@@ -152,9 +152,21 @@ impl CompressedBody {
                         Poll::Ready(Some(Ok(frame))) => {
                             match frame.into_data() {
                                 Ok(mut data) => {
-                                    // Compress the data
+                                    // Compress the data. If the encoder
+                                    // buffered the input without producing
+                                    // any output yet, loop back and read
+                                    // more frames — we can't return Pending
+                                    // here because the inner body already
+                                    // returned Ready, so no waker would be
+                                    // armed and the task would hang.
                                     let input_bytes = data.copy_to_bytes(data.remaining());
-                                    return self.compress_chunk(&input_bytes);
+                                    match self.compress_chunk(&input_bytes) {
+                                        Ok(Some(out)) => {
+                                            return Poll::Ready(Some(Ok(Frame::data(out))));
+                                        }
+                                        Ok(None) => continue,
+                                        Err(e) => return Poll::Ready(Some(Err(e))),
+                                    }
                                 }
                                 Err(frame) => {
                                     if let Ok(trailers) = frame.into_trailers() {
@@ -172,8 +184,11 @@ impl CompressedBody {
         }
     }
 
-    /// Compresses a chunk of input data.
-    fn compress_chunk(&mut self, input: &[u8]) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+    /// Compresses a chunk of input data. Returns `Ok(None)` when the
+    /// encoder accepted the input but hasn't emitted any output yet (the
+    /// caller must read more frames or transition to `Finishing` rather
+    /// than parking the task).
+    fn compress_chunk(&mut self, input: &[u8]) -> Result<Option<Bytes>, io::Error> {
         let mut input_buf = PartialBuffer::new(input);
         let mut all_output = BytesMut::new();
 
@@ -181,9 +196,9 @@ impl CompressedBody {
         loop {
             let mut output = WriteBuffer::new_initialized(self.output_buffer.as_mut_slice());
 
-            if let Err(e) = self.encoder.encode(&mut input_buf, &mut output) {
-                return Poll::Ready(Some(Err(io::Error::other(e))));
-            }
+            self.encoder
+                .encode(&mut input_buf, &mut output)
+                .map_err(io::Error::other)?;
 
             let written = output.written_len();
             if written > 0 {
@@ -206,28 +221,21 @@ impl CompressedBody {
             loop {
                 let mut output = WriteBuffer::new_initialized(self.output_buffer.as_mut_slice());
 
-                match self.encoder.flush(&mut output) {
-                    Ok(done) => {
-                        let written = output.written_len();
-                        if written > 0 {
-                            all_output.extend_from_slice(&self.output_buffer[..written]);
-                        }
-                        if done {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        return Poll::Ready(Some(Err(io::Error::other(e))));
-                    }
+                let done = self.encoder.flush(&mut output).map_err(io::Error::other)?;
+                let written = output.written_len();
+                if written > 0 {
+                    all_output.extend_from_slice(&self.output_buffer[..written]);
+                }
+                if done {
+                    break;
                 }
             }
         }
 
         if all_output.is_empty() {
-            // No output yet, need to continue polling
-            Poll::Pending
+            Ok(None)
         } else {
-            Poll::Ready(Some(Ok(Frame::data(all_output.freeze()))))
+            Ok(Some(all_output.freeze()))
         }
     }
 }
@@ -389,6 +397,35 @@ mod tests {
         while let Some(Ok(frame)) = poll_body(&mut body) {
             assert!(frame.is_data());
         }
+    }
+
+    /// Regression test: codecs that buffer all their input internally before
+    /// emitting any output (zstd, brotli, deflate for tiny payloads) used to
+    /// cause `compress_chunk` to return `Poll::Pending` without registering a
+    /// waker — the response body then hung forever. The body must drain all
+    /// frames cleanly even when the encoder produces nothing until `finish`.
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn test_compressed_drains_when_encoder_buffers() {
+        let inner = TestBody::new(vec![Frame::data(Bytes::from("hello world"))]);
+        let mut body = CompressionBody::compressed(inner, Codec::Zstd, false);
+
+        let mut total = BytesMut::new();
+        let mut frames = 0;
+        loop {
+            match poll_body(&mut body) {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        total.extend_from_slice(&data);
+                    }
+                    frames += 1;
+                    assert!(frames < 100, "body did not terminate");
+                }
+                Some(Err(e)) => panic!("unexpected error: {e}"),
+                None => break,
+            }
+        }
+        assert!(!total.is_empty(), "no compressed data was emitted");
     }
 
     #[test]
