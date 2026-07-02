@@ -1,6 +1,6 @@
 [package]
 name = "http-response-compression"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "MIT"
 description = "Tower middleware for compressing HTTP response bodies"
