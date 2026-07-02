@@ -54,6 +54,17 @@ fn wrap_response<B>(
 ) -> Response<CompressionBody<B>> {
     let (mut parts, body) = response.into_parts();
 
+    // Never compress responses that have no body: informational (1xx, including
+    // 101 Switching Protocols for WebSocket upgrades), 204 No Content, and 304
+    // Not Modified. Compressing these would stamp a bogus Content-Encoding header
+    // on the response (and, for upgrades, on the handshake).
+    if parts.status.is_informational()
+        || parts.status == http::StatusCode::NO_CONTENT
+        || parts.status == http::StatusCode::NOT_MODIFIED
+    {
+        return Response::from_parts(parts, CompressionBody::passthrough(body));
+    }
+
     // Determine if we should compress
     let dominated_codec = accepted_codec.filter(|_| {
         !has_content_encoding(&parts.headers)
@@ -531,6 +542,55 @@ mod tests {
                 assert!(state.always_flush());
             }
             _ => panic!("Expected compressed body"),
+        }
+    }
+
+    fn make_response_with_status(
+        body: &'static str,
+        status: http::StatusCode,
+    ) -> Response<&'static str> {
+        let mut response = Response::new(body);
+        *response.status_mut() = status;
+        response
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn test_no_compress_switching_protocols() {
+        // WebSocket upgrade responses (101) must not be compressed.
+        let response = make_response_with_status("", http::StatusCode::SWITCHING_PROTOCOLS);
+        let wrapped = wrap_response(response, Some(Codec::Gzip), 0);
+
+        match wrapped.body() {
+            crate::body::CompressionBody::Passthrough { .. } => {}
+            _ => panic!("Expected passthrough body for 101 Switching Protocols"),
+        }
+
+        // No bogus Content-Encoding should be added to the handshake response.
+        assert!(wrapped.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn test_no_compress_no_content() {
+        let response = make_response_with_status("", http::StatusCode::NO_CONTENT);
+        let wrapped = wrap_response(response, Some(Codec::Gzip), 0);
+
+        match wrapped.body() {
+            crate::body::CompressionBody::Passthrough { .. } => {}
+            _ => panic!("Expected passthrough body for 204 No Content"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn test_no_compress_not_modified() {
+        let response = make_response_with_status("", http::StatusCode::NOT_MODIFIED);
+        let wrapped = wrap_response(response, Some(Codec::Gzip), 0);
+
+        match wrapped.body() {
+            crate::body::CompressionBody::Passthrough { .. } => {}
+            _ => panic!("Expected passthrough body for 304 Not Modified"),
         }
     }
 
