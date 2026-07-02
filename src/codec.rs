@@ -98,11 +98,11 @@ impl Codec {
                     Some((_, best_quality)) if quality > *best_quality => {
                         best_codec = Some((codec, quality));
                     }
-                    Some((best, best_quality)) if quality == *best_quality => {
-                        // Prefer zstd > brotli > gzip > deflate when quality is equal
-                        if codec.priority() < best.priority() {
-                            best_codec = Some((codec, quality));
-                        }
+                    // Prefer zstd > brotli > gzip > deflate when quality is equal
+                    Some((best, best_quality))
+                        if quality == *best_quality && codec.priority() < best.priority() =>
+                    {
+                        best_codec = Some((codec, quality));
                     }
                     _ => {}
                 }
