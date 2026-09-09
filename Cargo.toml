@@ -1,10 +1,10 @@
 [package]
 name = "http-response-compression"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "MIT"
 description = "Tower middleware for compressing HTTP response bodies"
-repository = "https://github.com/bouk/http-response-compression"
+repository = "https://github.com/bouk/rust-compression"
 
 [features]
 default = ["zstd", "gzip", "deflate"]

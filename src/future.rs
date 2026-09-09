@@ -151,6 +151,13 @@ fn is_uncompressible_content_type(headers: &header::HeaderMap) -> bool {
         return !content_type.starts_with("image/svg+xml");
     }
 
+    // Skip native gRPC except gRPC-web: native gRPC clients do not decode HTTP
+    // Content-Encoding, and the request's Accept-Encoding may have been forwarded
+    // by a grpc-web proxy on behalf of a browser.
+    if content_type.starts_with("application/grpc") {
+        return !content_type.starts_with("application/grpc-web");
+    }
+
     false
 }
 
@@ -451,34 +458,30 @@ mod tests {
 
     #[test]
     #[cfg(feature = "gzip")]
-    fn test_compress_application_grpc() {
+    fn test_skip_application_grpc() {
         let response =
             make_response_with_headers("grpc data", [("content-type", "application/grpc")]);
         let wrapped = wrap_response(response, Some(Codec::Gzip), 0);
 
-        // Should be compressed with streaming (always_flush)
-        match wrapped.body() {
-            crate::body::CompressionBody::Compressed { state, .. } => {
-                assert!(state.always_flush());
-            }
-            _ => panic!("Expected compressed body for application/grpc"),
-        }
+        assert!(matches!(
+            wrapped.body(),
+            crate::body::CompressionBody::Passthrough { .. }
+        ));
+        assert!(!wrapped.headers().contains_key(header::CONTENT_ENCODING));
     }
 
     #[test]
     #[cfg(feature = "gzip")]
-    fn test_compress_application_grpc_with_suffix() {
+    fn test_skip_application_grpc_with_suffix() {
         let response =
             make_response_with_headers("grpc data", [("content-type", "application/grpc+proto")]);
         let wrapped = wrap_response(response, Some(Codec::Gzip), 0);
 
-        // Should be compressed with streaming (always_flush)
-        match wrapped.body() {
-            crate::body::CompressionBody::Compressed { state, .. } => {
-                assert!(state.always_flush());
-            }
-            _ => panic!("Expected compressed body for application/grpc+proto"),
-        }
+        assert!(matches!(
+            wrapped.body(),
+            crate::body::CompressionBody::Passthrough { .. }
+        ));
+        assert!(!wrapped.headers().contains_key(header::CONTENT_ENCODING));
     }
 
     #[test]
