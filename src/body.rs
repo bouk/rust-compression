@@ -193,7 +193,7 @@ impl CompressedBody {
         let mut all_output = BytesMut::new();
 
         // Keep encoding until all input is consumed
-        loop {
+        while input_buf.written_len() < input.len() {
             let mut output = WriteBuffer::new_initialized(self.output_buffer.as_mut_slice());
 
             self.encoder
@@ -203,11 +203,6 @@ impl CompressedBody {
             let written = output.written_len();
             if written > 0 {
                 all_output.extend_from_slice(&self.output_buffer[..written]);
-            }
-
-            // Check if we've consumed all input
-            if input_buf.written_len() >= input.len() {
-                break;
             }
 
             // Safety check to prevent infinite loop
@@ -426,6 +421,77 @@ mod tests {
             }
         }
         assert!(!total.is_empty(), "no compressed data was emitted");
+    }
+
+    #[test]
+    fn test_compressed_handles_empty_data_frames() {
+        let codecs = [
+            #[cfg(feature = "gzip")]
+            Codec::Gzip,
+            #[cfg(feature = "deflate")]
+            Codec::Deflate,
+            #[cfg(feature = "zstd")]
+            Codec::Zstd,
+            #[cfg(feature = "brotli")]
+            Codec::Brotli,
+        ];
+        for codec in codecs {
+            for always_flush in [false, true] {
+                for payload in [b"".as_slice(), b"hello world".as_slice()] {
+                    let mut outputs = Vec::new();
+                    for include_empty_frames in [false, true] {
+                        let mut frames = Vec::new();
+                        if include_empty_frames {
+                            frames.push(Frame::data(Bytes::new()));
+                        }
+                        for chunk in payload.chunks(5) {
+                            frames.push(Frame::data(Bytes::copy_from_slice(chunk)));
+                            if include_empty_frames {
+                                frames.push(Frame::data(Bytes::new()));
+                                frames.push(Frame::data(Bytes::new()));
+                            }
+                        }
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert("x-checksum", "abc123".parse().unwrap());
+                        frames.push(Frame::trailers(trailers.clone()));
+                        let mut body =
+                            CompressionBody::compressed(TestBody::new(frames), codec, always_flush);
+                        let mut output = BytesMut::new();
+                        let mut received_trailers = None;
+                        while let Some(frame) = poll_body(&mut body) {
+                            let frame = frame.expect("compression failed");
+                            match frame.into_data() {
+                                Ok(data) => output.extend_from_slice(&data),
+                                Err(frame) => {
+                                    received_trailers = Some(frame.into_trailers().unwrap())
+                                }
+                            }
+                        }
+                        assert!(body.is_end_stream());
+                        assert_eq!(received_trailers, Some(trailers));
+                        outputs.push(output);
+                    }
+                    if !always_flush {
+                        assert_eq!(
+                            outputs[0], outputs[1],
+                            "empty frames changed {codec:?} output"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "gzip")]
+    fn test_empty_chunk_flushes_gzip() {
+        let mut state = CompressedBody::new(Codec::Gzip, true);
+        let output = state
+            .compress_chunk(&[])
+            .unwrap()
+            .expect("empty chunk must still flush the gzip header");
+        assert!(output.starts_with(&[0x1f, 0x8b]));
+        assert!(state.compress_chunk(&[]).unwrap().is_none());
     }
 
     #[test]
